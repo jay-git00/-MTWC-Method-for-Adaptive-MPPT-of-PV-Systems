@@ -1,0 +1,174 @@
+%{
+function D = TWC_MPP(Ipv, Vpv)
+%#codegen
+
+
+persistent V_old P_old D_old initFlag
+
+if isempty(initFlag)
+    V_old   = 1e-3;   % small nonzero voltage
+    P_old   = 1e-3;   % small nonzero power
+    D_old   = 0.5;    % start with 50% duty
+    initFlag = true;
+end
+
+% --- Check for invalid inputs ---
+if isnan(Ipv) || isnan(Vpv) || isinf(Ipv) || isinf(Vpv)
+    D = D_old;   % hold previous duty
+    return;
+end
+
+% --- Compute Power ---
+P = Vpv * Ipv;
+if P < 0
+    P = 0; % prevent negative power at startup
+end
+
+% --- TWC logic ---
+if P > P_old
+    if Vpv > V_old
+        D_old = D_old - 0.01;  
+    else
+        D_old = D_old + 0.01;  
+    end
+else
+    if Vpv > V_old
+        D_old = D_old + 0.01;
+    else
+        D_old = D_old - 0.01;
+    end
+end
+
+% --- Limit duty cycle to [0,1] ---
+D_old = min(max(D_old, 0), 1);
+
+% --- Save previous values ---
+V_old = Vpv;
+P_old = P;
+
+% --- Output ---
+D = D_old;
+
+end
+%}
+
+
+function D = GMPPT_Optimized(Ipv, Vpv)
+%#codegen
+
+% Persistent variables for the algorithm
+persistent V_old P_old D_old initFlag
+persistent scanCounter scanFlag D_scan_best P_scan_best
+persistent timer % Internal timer to control execution speed
+
+% --- Initialization ---
+if isempty(initFlag)
+    V_old   = 1e-3;
+    P_old   = 1e-3;
+    D_old   = 0.5;   % Start with 50% duty
+    
+    % Global Scan Parameters
+    scanCounter = 0;
+    scanFlag = false;
+    D_scan_best = 0.5;
+    P_scan_best = 1e-3;
+    
+    % Timer initialization
+    timer = 0;
+    
+    initFlag = true;
+end
+
+% --- KEY PARAMETERS TO TUNE ---
+T_sample        = 1e-4;   % Algorithm sample time (e.g., 0.1 ms). CRITICAL PARAMETER.
+MAX_STEP        = 0.01;   % Max step size for large power changes
+MIN_STEP        = 0.0005; % Min step size for fine-tuning near MPP
+SCAN_INTERVAL   = 200;    % Run global scan every 200 valid steps
+SCAN_LENGTH     = 20;     % Number of steps in the global scan
+SCAN_STEP       = 0.04;   % Step size for the global scan sweep
+
+% --- Internal Timer Logic ---
+% This is the most important part to fix oscillations.
+% The code only executes a decision every T_sample seconds.
+dt = 1e-6; % Must match your simulation's fixed step size or be a reasonable guess
+timer = timer + dt;
+if timer < T_sample
+    D = D_old; % Hold the previous duty cycle and wait
+    return;
+end
+timer = 0; % Reset timer for the next interval
+
+% --- Main Logic (runs only when timer allows) ---
+
+% --- Check for invalid inputs ---
+if isnan(Ipv) || isnan(Vpv) || isinf(Ipv) || isinf(Vpv)
+    D = D_old;
+    return;
+end
+
+% Compute Current Power
+P = Vpv * Ipv;
+if P < 0; P = 0; end
+
+dP = P - P_old;
+dV = Vpv - V_old;
+
+if scanFlag
+    % --- Global Scan Phase ---
+    scanCounter = scanCounter + 1;
+    if scanCounter <= SCAN_LENGTH
+        D_old = D_old - SCAN_STEP; % Sweep duty cycle (e.g., downwards)
+        if P > P_scan_best
+            P_scan_best = P;
+            D_scan_best = D_old;
+        end
+    else
+        % Scan complete, jump to the best point found
+        D_old = D_scan_best;
+        scanFlag = false;
+        scanCounter = 0;
+    end
+else
+    % --- Local Tracking Phase ---
+    scanCounter = scanCounter + 1;
+    if scanCounter >= SCAN_INTERVAL
+        % Trigger a new scan
+        scanFlag = true;
+        scanCounter = 0;
+        P_scan_best = P;
+        D_scan_best = D_old;
+    else
+        % --- Variable Step Size P&O ---
+        if abs(dP) > 0.1 % Only act if power change is significant
+            
+            % 1. Determine the step size based on how close we are to the peak
+            % A larger dP suggests we are far away.
+            step = min(MAX_STEP, max(MIN_STEP, abs(dP) * 0.001));
+
+            % 2. P&O Logic
+            if dP > 0
+                if dV > 0
+                    D_old = D_old - step; % Moving up the hill, V increasing
+                else
+                    D_old = D_old + step; % Moving up the hill, V decreasing
+                end
+            else
+                if dV > 0
+                    D_old = D_old + step; % Moving down the hill, V increasing -> reverse
+                else
+                    D_old = D_old - step; % Moving down the hill, V decreasing -> reverse
+                end
+            end
+        end
+        % If dP is very small, do nothing and hold D_old, preventing oscillation.
+    end
+end
+
+% --- Finalize and Save State ---
+D_old = min(max(D_old, 0.05), 0.95); % Limit duty cycle
+
+V_old = Vpv;
+P_old = P;
+D = D_old;
+
+end
